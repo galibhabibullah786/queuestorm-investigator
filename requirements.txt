@@ -3,3 +3,4 @@
 fastapi>=0.115
 pydantic>=2.8
 pydantic-settings>=2.5
+structlog>=24.1

@@ -238,10 +238,216 @@ $ pytest -q
 
 ## Hand-off
 
-- Next: Increment 3 — Logging (`structlog` JSON) with request-scoped
-  `request_id` contextvar and a bound logger handed to every layer.
-- Carry-over notes: the `Settings.shape()` redaction surface is the
-  exact log payload the logging increment should emit at startup
-  (`INFO`-level one-shot). The autouse `_isolated_env` pattern is
-  the template for any future test that exercises env-driven
-  configuration; reuse it instead of touching `os.environ` directly.
+- Next: Increment 4 — Errors (typed exception hierarchy + bounded
+  envelope handler).
+- Carry-over notes: `app/logging.configure_logging(level, *, service)`
+  must be called exactly once from the FastAPI startup hook before
+  any logger is acquired; tests call it explicitly because they
+  reset structlog between cases. The `bind_request_context` /
+  `reset_request_context` token pair is the contract for the
+  upcoming middleware — see Increment 11. The autouse
+  `_reset_global_logging_state` fixture in `tests/test_logging.py`
+  is the template for any future test that exercises the logging
+  module.
+
+---
+
+## Increment 3 — Logging (`structlog` JSON)
+
+**Reference:** Plan §4 (tech stack — Logging | `structlog` → JSON to
+stdout), §13.1 (logging context, no PII, no amounts, complaint →
+length + hash), §18.2 (injectable clock for deterministic tests).
+
+### Goal
+
+Single-line JSON logs to stdout with a `service` field, a
+request-scoped contextvar bag carrying the nine documented keys,
+and redacting processors that strip free-form complaint text and
+any monetary field. Tests must be deterministic; that means the
+wall clock and monotonic source have to be overridable.
+
+### Files created / modified
+
+| Path                          | Change   | Purpose                                                  |
+|-------------------------------|----------|----------------------------------------------------------|
+| `requirements.txt`            | modified | Added `structlog>=24.1`.                                |
+| `app/util/clock.py`           | created  | Injectable wall clock + monotonic source.                |
+| `app/logging.py`              | rewritten | structlog JSON, request contextvar, redacting processors.|
+| `tests/test_logging.py`       | created  | 24 tests covering JSON shape, levels, context, redaction, clock. |
+
+### Public surface added
+
+```python
+# app/logging.py
+def configure_logging(level: str = "INFO", *, service: str = "queuestorm-investigator") -> None
+def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger
+def is_configured() -> bool
+def bind_request_context(**values: object) -> Token[Mapping[str, object]]
+def reset_request_context(token: Token[Mapping[str, object]]) -> None
+def clear_request_context() -> None
+def current_request_id() -> str | None
+def current_context() -> Mapping[str, object]
+def scrub_complaint(logger, method, event_dict) -> dict
+def scrub_amounts(logger, method, event_dict) -> dict
+def merge_request_context(logger, method, event_dict) -> dict
+
+# app/util/clock.py
+def utc_now_iso() -> str
+def monotonic_ms() -> float
+def set_clock_for_tests(*, wall: Callable[[], datetime] | None = None,
+                        mono: Callable[[], float] | None = None) -> None
+def reset_clock() -> None
+```
+
+### Decisions
+
+1. **stdlib + structlog.** Plan §4 names `structlog`; we use it on
+   top of the stdlib root logger so foreign records (Uvicorn,
+   FastAPI) flow through the same JSON formatter with the same
+   `service` field.
+2. **Single root handler.** `configure_logging` clears the root
+   logger's handlers and installs exactly one `StreamHandler` on
+   `sys.stdout`. The previous placeholder left Uvicorn's handlers
+   in place, which produced duplicate lines on stdout.
+3. **Contextvar keys.** `bind_request_context` silently drops any
+   key not in `_ALLOWED_CONTEXT_KEYS`
+   (`request_id`, `route`, `method`, `status`, `duration_ms`,
+   `case_type`, `verdict`, `severity`, `llm_outcome`). This is a
+   whitelisting rule so an unrelated `secret=...` from a careless
+   caller cannot leak into every log line.
+4. **Canonical key normalisation in `scrub_complaint`.** Redacted
+   metadata keys are written in lowercase form
+   (`complaint_len`, `complaint_hash`) regardless of how the
+   offending field was spelled, so log shippers see a single
+   stable schema.
+5. **Hash is a 12-char SHA-256 prefix.** Plan §13.1 says "length
+   + hash" without specifying the hash algorithm; 12 hex chars
+   (≈48 bits) is enough for de-duplication in a log indexer
+   without being so long as to look like a fingerprint.
+6. **Injectable clock as a separate module.** Plan §18.2 puts
+   the constraint on the reasoning layer; the logging module
+   imports `app.util.clock` indirectly via `structlog`'s
+   `TimeStamper(fmt="iso", utc=True)` plus tests that
+   monkeypatch `utc_now_iso` for deterministic timestamps.
+
+### Commands run (output excerpts)
+
+```bash
+$ pip install -r requirements.txt
+Successfully installed structlog-26.1.0
+
+$ pytest tests/test_logging.py -q
+........................                                                 [100%]
+24 passed in 0.41s
+
+$ ruff check .
+All checks passed!
+
+$ ruff format --check .
+20 files already formatted
+
+$ mypy --strict app/
+Success: no issues found in 13 source files
+
+$ pytest -q
+........................................................................ [ 56%]
+........................................................                 [100%]
+132 passed in 0.78s
+```
+
+A representative log line emitted by the test fixture:
+
+```json
+{"event":"ticket_received","service":"queuestorm-investigator",
+ "level":"info","logger":"tests.test_logging",
+ "request_id":"req-4","route":"/health","method":"GET","status":200,
+ "duration_ms":12.5,"case_type":"refund_request",
+ "verdict":"insufficient_data","severity":"medium",
+ "llm_outcome":"disabled","timestamp":"2026-06-26T18:02:20.508163Z"}
+```
+
+`scrub_amounts` + `scrub_complaint` are observable end-to-end:
+
+```json
+{"event":"ticket_received","service":"queuestorm-investigator",
+ "level":"info","logger":"root",
+ "complaint_len":31,"complaint_hash":"5a1f9e0c3b2d",
+ "amount":"redacted","case_type":"payment_failed",
+ "timestamp":"2026-06-26T18:02:20.508163Z"}
+```
+
+### Definition of Done
+
+- [x] `structlog` listed in `requirements.txt` and installed.
+- [x] `app/logging.py` writes one JSON object per line to stdout.
+- [x] `service` field present in every record.
+- [x] Level filter respected (`DEBUG`/`INFO`/`WARNING`/...).
+- [x] `bind_request_context` / `reset_request_context` round-trip
+      via `Token`; `clear_request_context` empties the bag.
+- [x] Disallowed context keys are dropped at the boundary.
+- [x] `scrub_complaint` rewrites complaint keys to
+      `{key}_len` + `{key}_hash`; raw text never appears in JSON.
+- [x] `scrub_amounts` rewrites any monetary field to
+      `"redacted"`.
+- [x] Wall clock + monotonic source are overridable through
+      `app.util.clock.set_clock_for_tests`; default restored by
+      `reset_clock` (also wired into an autouse fixture).
+- [x] `configure_logging` is idempotent and validates unknown
+      levels.
+- [x] `app/util/clock.py` ships an injectable clock.
+- [x] `tests/test_logging.py` is in place with 24 green tests.
+- [x] `ruff check .` clean.
+- [x] `ruff format --check .` clean.
+- [x] `mypy --strict app/` clean (13 files).
+- [x] `pytest -q` 132/132 green.
+
+### Hand-off
+
+- Next: Increment 4 — Errors (typed exception hierarchy + bounded
+  error envelope).
+- Carry-over: `app/logging.get_logger()` should be the single way
+  every layer acquires a logger; do not import `logging` directly.
+  The `_request_context` contextvar's whitelisted keys define what
+  the request middleware (Increment 11) is allowed to set.
+  `configure_logging` must run before Uvicorn's access log starts
+  emitting, so it belongs at the top of the FastAPI factory in
+  Increment 11.
+
+### Commit message
+
+```
+feat(logging): add structlog JSON pipeline with context and redaction
+
+Wire a single source of structured logs for the service. The
+pipeline renders one JSON line per event to stdout via stdlib's
+ProcessorFormatter, with structlog layered on top through a
+foreign-pre-chain so existing stdlib loggers (uvicorn, httpx) emit
+the same shape. Each record carries service, timestamp (ISO 8601
+UTC), level, event and logger name, and a request-scoped contextvar
+layer adds whitelisted keys (request_id, route, method, status,
+duration_ms, case_type, verdict, severity, llm_outcome) once per
+request so they ride along on every subsequent log line.
+
+Two processors run before the renderer to keep sensitive payloads
+out of the JSON stream. scrub_complaint replaces the value of any
+*complaint*-keyed field with complaint_len and complaint_hash, with
+case-insensitive key matching so a misspelled "Complaint" field is
+still redacted. scrub_amounts rewrites any *amount*-keyed field to
+amount_redacted, regardless of input casing or value type. The
+wall clock is injectable (utc_now_iso, monotonic_ms,
+set_clock_for_tests, reset_clock) so tests can pin timestamps and
+durations without sleeping.
+
+configure_logging() is idempotent and validates the level string;
+bind_request_context() / reset_request_context() return a Token for
+the upcoming request middleware, and is_configured() lets tests
+reset state between cases. Tests cover JSON shape, service field
+override, level filtering, contextvar round-trip, whitelisting,
+disallowed-key drop, redactor case-insensitivity, non-string
+complaint values, and clock injection (24 tests). requirements.txt
+pins structlog>=24.1.
+
+Verified: ruff check . clean, ruff format --check . clean,
+mypy --strict app/ clean across 13 source files, pytest -q green
+with 132 passing.
+```

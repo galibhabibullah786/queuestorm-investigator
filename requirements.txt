@@ -1,0 +1,4 @@
+# Runtime dependencies for queuestorm-investigator.
+# Populated incrementally as development progresses.
+fastapi>=0.115
+pydantic>=2.8

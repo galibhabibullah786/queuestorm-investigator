@@ -1,0 +1,1 @@
+"""Optional LLM adapter layer."""

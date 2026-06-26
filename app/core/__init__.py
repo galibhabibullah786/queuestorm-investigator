@@ -1,0 +1,1 @@
+"""Reasoning core (pure-Python)."""

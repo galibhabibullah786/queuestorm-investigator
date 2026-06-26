@@ -62,7 +62,7 @@ verification output lives in [`build_log.md`](build_log.md).
 |----|--------------------------------------------|------------|-------|-------|
 | 0  | Project skeleton + toolchain               | ✅ done    | 2/2   | `create_app()` factory; `ruff`, `mypy --strict`, `pytest` wired |
 | 1  | Schemas (Pydantic v2)                      | ✅ done    | 68/68 | Frozen `Literal` enums for request/response; contract tests |
-| 2  | Configuration (`pydantic-settings`)        | ⏳ pending | —     | Env loading, secret redaction |
+| 2  | Configuration (`pydantic-settings`)        | ✅ done    | 36/36 | Frozen `Settings`, `SecretStr` for LLM key, `shape()` redaction |
 | 3  | Logging (`structlog` JSON)                 | ⏳ pending | —     | Request-scoped `request_id` contextvar |
 | 4  | Errors (typed exceptions + handler)        | ⏳ pending | —     | Bounded error envelope |
 | 5  | Safety layer (pure regex)                  | ⏳ pending | —     | Phishing override, credential/PII rewrite |

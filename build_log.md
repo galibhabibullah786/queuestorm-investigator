@@ -134,3 +134,114 @@ $ pytest -q
 
 ---
 
+
+---
+
+# Increment 2 — Configuration (`pydantic-settings`)
+
+## Reference
+
+- Design doc §12 (Configuration): frozen `Settings(BaseSettings)` with
+  `env_nested_delimiter="__"`, secrets as `SecretStr`, redaction in
+  logging.
+- No change to request/response schemas (carried over from increment 1).
+
+## Files created / modified
+
+- **modified** `requirements.txt` — added `pydantic-settings>=2.5`.
+- **created** `app/config.py` — `Settings` model with 12 fields,
+  bounds validators, `SecretStr` for `llm_api_key`, heuristic
+  redaction in `Settings.shape()` via the module-level `_redact`,
+  `@lru_cache(maxsize=1) get_settings()` singleton.
+- **created** `.env.example` — documented env keys grouped as
+  Process/transport, Optional feature flags, Optional LLM provider.
+- **created** `tests/test_config.py` — 36 tests covering defaults,
+  flat env overrides, `SecretStr`, `extra="ignore"`, frozen instance,
+  `shape()` redaction, `get_settings()` caching and lazy
+  re-construction, parametrized shape sanity for every field.
+
+## Tests added
+
+- `tests/test_config.py` — 36 cases:
+  - 1 default-values snapshot
+  - 3 flat-env override cases (`test_flat_env_overrides_apply`,
+    `test_llm_api_key_is_secret_str`, `test_llm_api_key_absent_is_none`)
+  - 1 nested-delimiter smoke
+  - 8 validation bounds (port ×2, max_body_bytes ×2,
+    request_timeout_ms, llm_timeout_ms, llm_cache_size, log_level)
+  - 1 unknown-env ignored
+  - 1 frozen instance
+  - 5 `shape()` redaction cases
+  - 4 `get_settings()` lifecycle cases
+  - 12 parametrized shape-safety cases (one per field)
+
+Total: **104 passed** (`pytest -q` → `104 passed in 0.60s`), up from
+68 at the close of increment 1.
+
+## Commands run
+
+```text
+$ ruff check .
+All checks passed!
+
+$ ruff format --check .
+18 files already formatted
+
+$ mypy --strict app/
+Success: no issues found in 12 source files
+
+$ pytest -q
+........................................................................ [ 69%]
+................................                                         [100%]
+104 passed in 0.60s
+```
+
+## Notes / decisions
+
+- `llm_api_key` is wrapped in `pydantic.SecretStr` at the field level
+  so `repr()` and `str()` are redacted by default; the `shape()`
+  helper additionally redacts any future field whose name contains
+  `api_key`, `secret`, `password`, or `token` (defence-in-depth).
+- `env_nested_delimiter="__"` is declared so a future nested `LLM`
+  sub-model would route `LLM__TIMEOUT_MS` → `llm.timeout_ms`. Today
+  the LLM fields are flat top-level fields; their canonical env
+  binding is therefore `LLM_TIMEOUT_MS` (underscore-joined).
+  Unknown `LLM__*` keys are dropped by `extra="ignore"`.
+- `get_settings()` is `lru_cache(maxsize=1)` so the process-wide
+  instance is stable; tests that need a fresh read call
+  `get_settings.cache_clear()` inside an autouse `_isolated_env`
+  fixture that strips every config-related env var before each case.
+- The first test pass failed 9 cases because they passed
+  env-style `UPPERCASE` keys as constructor kwargs; pydantic-settings
+  only honours kwargs whose names match declared model attributes,
+  so `Settings(_env_file=None, PORT="0")` silently fell back to the
+  default and never reached the validator. The fix was to drive the
+  bad values through `monkeypatch.setenv(...)` so they reach the
+  model via the real env-var pathway, matching the pattern already
+  used in `test_flat_env_overrides_apply`. The same lesson led to
+  renaming the nested-delimiter test to assert the actual binding
+  (`LLM_TIMEOUT_MS`) rather than the not-yet-bound `LLM__TIMEOUT_MS`.
+
+## Definition of Done
+
+- [x] All listed files exist.
+- [x] `from app.config import Settings, get_settings` works.
+- [x] `Settings(_env_file=None)` returns defaults; env overrides via
+      `monkeypatch.setenv` apply; validators reject out-of-range
+      values with `ValidationError`.
+- [x] `pytest -q` is green (104 tests passing).
+- [x] `ruff check .` and `ruff format --check .` are clean.
+- [x] `mypy --strict app/` is clean (12 source files).
+- [x] `README.md` progress table row 2 marked ✅ done.
+- [x] `build_log.md` updated with this increment report.
+- [x] No new files outside the canonical layout.
+
+## Hand-off
+
+- Next: Increment 3 — Logging (`structlog` JSON) with request-scoped
+  `request_id` contextvar and a bound logger handed to every layer.
+- Carry-over notes: the `Settings.shape()` redaction surface is the
+  exact log payload the logging increment should emit at startup
+  (`INFO`-level one-shot). The autouse `_isolated_env` pattern is
+  the template for any future test that exercises env-driven
+  configuration; reuse it instead of touching `os.environ` directly.
